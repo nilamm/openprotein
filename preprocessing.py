@@ -19,7 +19,8 @@ from util import calculate_dihedral_angles_over_minibatch, \
 
 MAX_SEQUENCE_LENGTH = 2000
 
-def process_raw_data(use_gpu, raw_data_path="data/raw/*", force_pre_processing_overwrite=True):
+def process_raw_data(use_gpu, raw_data_path="data/raw/*", force_pre_processing_overwrite=True, output_path="data/preprocessed/"):
+    print("2-EDITED\n\n\n")
     write_out("Starting pre-processing of raw data...")
     input_files = glob.glob(raw_data_path)
     write_out(input_files)
@@ -29,7 +30,7 @@ def process_raw_data(use_gpu, raw_data_path="data/raw/*", force_pre_processing_o
             filename = file_path.split('\\')[-1]
         else:
             filename = file_path.split('/')[-1]
-        preprocessed_file_name = "data/preprocessed/" + filename + ".hdf5"
+        preprocessed_file_name = output_path + filename + ".hdf5"
 
         # check if we should remove any previously processed files
         if os.path.isfile(preprocessed_file_name):
@@ -119,9 +120,17 @@ def read_protein_from_file(file_pointer):
                         dict_['tertiary'][elem][sequence_start * 3:sequence_end * 3]
 
         elif next_line == '\n':
+            if 'secondary' not in dict_:
+                dict_['secondary'] = [8] * len(dict_['primary'])
+            else:
+                print("*" * 10, dict_['secondary'])
             return dict_, missing_internal_aa
         elif next_line == '':
             if dict_:
+                if 'secondary' not in dict_:
+                    dict_['secondary'] = [8] * len(dict_['primary'])
+                else:
+                    print("*" * 10, dict_['secondary'])
                 return dict_, missing_internal_aa
             else:
                 return None, False
@@ -139,6 +148,12 @@ def process_file(input_file, output_file, use_gpu):
     dset3 = file.create_dataset('mask', (current_buffer_size, MAX_SEQUENCE_LENGTH),
                                 maxshape=(None, MAX_SEQUENCE_LENGTH),
                                 dtype='uint8')
+    dset4 = file.create_dataset('angle', (current_buffer_size, MAX_SEQUENCE_LENGTH, 3),
+                                maxshape=(None, MAX_SEQUENCE_LENGTH, 3), dtype='float')
+    dset5 = file.create_dataset('secondary', (current_buffer_size, MAX_SEQUENCE_LENGTH),
+                                maxshape=(None, MAX_SEQUENCE_LENGTH), dtype='int32')
+    dset6 = file.create_dataset('id', (current_buffer_size, 1),
+                                maxshape=(None, 1), dtype=h5py.string_dtype())
 
     input_file_pointer = open(input_file, "r")
 
@@ -160,14 +175,21 @@ def process_file(input_file, output_file, use_gpu):
             dset1.resize((current_buffer_size, MAX_SEQUENCE_LENGTH))
             dset2.resize((current_buffer_size, MAX_SEQUENCE_LENGTH, 9))
             dset3.resize((current_buffer_size, MAX_SEQUENCE_LENGTH))
+            dset4.resize((current_buffer_size, MAX_SEQUENCE_LENGTH, 3))
+            dset5.resize((current_buffer_size, MAX_SEQUENCE_LENGTH))
+            dset6.resize((current_buffer_size, 1))
 
         primary_padded = np.zeros(MAX_SEQUENCE_LENGTH)
         tertiary_padded = np.zeros((9, MAX_SEQUENCE_LENGTH))
         mask_padded = np.zeros(MAX_SEQUENCE_LENGTH)
+        secondary_padded = np.zeros(MAX_SEQUENCE_LENGTH)
 
         # masking and padding here happens so that the stored dataset is of the same size.
         # when the data is loaded in this padding is removed again.
         primary_padded[:sequence_length] = next_protein['primary']
+        
+        secondary_padded[:sequence_length] = next_protein['secondary']
+
         t_transposed = np.ravel(np.array(next_protein['tertiary']).T)
         t_reshaped = np.reshape(t_transposed, (sequence_length, 9)).T
         tertiary_padded[:, :sequence_length] = t_reshaped
@@ -175,6 +197,11 @@ def process_file(input_file, output_file, use_gpu):
         mask = torch.Tensor(mask_padded).type(dtype=torch.bool)
         prim = torch.masked_select(torch.Tensor(primary_padded)\
                                    .type(dtype=torch.long), mask)
+        
+
+        sec = torch.masked_select(torch.Tensor(secondary_padded)\
+                                               .type(dtype=torch.long), mask)
+        
         pos = torch.masked_select(torch.Tensor(tertiary_padded), mask)\
                   .view(9, -1).transpose(0, 1).unsqueeze(1)
         pos_angstrom = pos / 100
@@ -191,22 +218,31 @@ def process_file(input_file, output_file, use_gpu):
                                                          batch_sizes,
                                                          use_gpu=use_gpu)
         tertiary = tertiary.squeeze(1)
+        angles = angles.squeeze(1)
+
 
         # create variables to store padded sequences in
         primary_padded = np.zeros(MAX_SEQUENCE_LENGTH)
         tertiary_padded = np.zeros((MAX_SEQUENCE_LENGTH, 9))
         mask_padded = np.zeros(MAX_SEQUENCE_LENGTH)
+        angle_padded = np.zeros((MAX_SEQUENCE_LENGTH, 3))
+        secondary_padded = np.zeros(MAX_SEQUENCE_LENGTH)
 
         # store padded sequences
         length_after_mask_removed = len(prim)
         primary_padded[:length_after_mask_removed] = prim.data.cpu().numpy()
+        secondary_padded[:length_after_mask_removed] = sec.data.cpu().numpy()
         tertiary_padded[:length_after_mask_removed, :] = tertiary.data.cpu().numpy()
         mask_padded[:length_after_mask_removed] = np.ones(length_after_mask_removed)
+        angle_padded[:length_after_mask_removed, :] = angles.data.cpu().numpy()
 
         # save padded sequences on disk
         dset1[current_buffer_allocation] = primary_padded
         dset2[current_buffer_allocation] = tertiary_padded
         dset3[current_buffer_allocation] = mask_padded
+        dset4[current_buffer_allocation] = angle_padded
+        dset5[current_buffer_allocation] = secondary_padded
+        dset6[current_buffer_allocation] = next_protein['id']
         current_buffer_allocation += 1
     if current_buffer_allocation == 0:
         write_out("Preprocessing was selected but no proteins in the input file "

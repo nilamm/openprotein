@@ -22,32 +22,49 @@ AA_ID_DICT = {'A': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5, 'G': 6, 'H': 7, 'I': 8, 'K
               'L': 10, 'M': 11, 'N': 12, 'P': 13, 'Q': 14, 'R': 15, 'S': 16, 'T': 17,
               'V': 18, 'W': 19, 'Y': 20}
 
+_dssp_dict = {'L': 0, 'H': 1, 'B': 2, 'E': 3, 'G': 4, 'I': 5, 'T': 6, 'S': 7}
+
 PI_TENSOR = torch.tensor([3.141592])
 
-def contruct_dataloader_from_disk(filename, minibatch_size):
-    return torch.utils.data.DataLoader(H5PytorchDataset(filename),
+def contruct_dataloader_from_disk(filename, minibatch_size, secondary_data, indices):
+    return torch.utils.data.DataLoader(H5PytorchDataset(filename, secondary_data, indices),
                                        batch_size=minibatch_size,
                                        shuffle=True,
-                                       collate_fn=merge_samples_to_minibatch)
+                                       collate_fn=merge_samples_to_minibatch,
+                                       pin_memory=False)
 
 
 class H5PytorchDataset(torch.utils.data.Dataset):
-    def __init__(self, filename):
+    def __init__(self, filename, secondary_dict, indices=None):
         super(H5PytorchDataset, self).__init__()
 
         self.h5pyfile = h5py.File(filename, 'r')
         self.num_proteins, self.max_sequence_len = self.h5pyfile['primary'].shape
+        self.secondary_dict = secondary_dict
+        self.indices = indices
 
     def __getitem__(self, index):
+        if self.indices is not None:
+            index = self.indices[index]
         mask = torch.Tensor(self.h5pyfile['mask'][index, :]).type(dtype=torch.bool)
         prim = torch.masked_select(
             torch.Tensor(self.h5pyfile['primary'][index, :]).type(dtype=torch.int),
             mask)
+
         tertiary = torch.Tensor(self.h5pyfile['tertiary'][index][:int(mask.sum())])# max length x 9
-        return prim, tertiary, mask
+
+        angle = torch.Tensor(self.h5pyfile['angle'][index][:int(mask.sum())])
+        _id = self.h5pyfile['id'][index][0].split("#")[1] if "#" in self.h5pyfile['id'][index][0] else self.h5pyfile['id'][index][0]
+        if _id in self.secondary_dict:
+            sec = [_dssp_dict[x] for x in self.secondary_dict[_id]['DSSP']]
+            secondary = torch.Tensor(sec[:int(mask.sum())])
+        else:
+            secondary = None
+        
+        return prim, tertiary, mask, angle, _id, secondary
 
     def __len__(self):
-        return self.num_proteins
+        return self.num_proteins if self.indices is None else len(self.indices)
 
 
 def merge_samples_to_minibatch(samples):
@@ -178,13 +195,18 @@ def calculate_dihedral_angles(atomic_coords, use_gpu):
                         zero_tensor)).view(-1, 3)
     return angles
 
-def compute_cross(tensor_a, tensor_b, dim):
+def compute_cross(tensor_a, tensor_b, dim, use_gpu=False):
 
     result = []
 
     x = torch.zeros(1).long()
     y = torch.ones(1).long()
     z = torch.ones(1).long() * 2
+
+    if use_gpu:
+        x = x.cuda()
+        y = y.cuda()
+        z = z.cuda()
 
     ax = torch.index_select(tensor_a, dim, x).squeeze(dim)
     ay = torch.index_select(tensor_a, dim, y).squeeze(dim)
@@ -291,7 +313,7 @@ def calc_pairwise_distances(chain_a, chain_b, use_gpu):
     return torch.sqrt(distance_matrix + epsilon)
 
 
-def calc_drmsd(chain_a, chain_b, use_gpu=False):
+def calc_drmsd(chain_a, chain_b, use_gpu=True):
     assert len(chain_a) == len(chain_b)
     distance_matrix_a = calc_pairwise_distances(chain_a, chain_a, use_gpu)
     distance_matrix_b = calc_pairwise_distances(chain_b, chain_b, use_gpu)
@@ -541,6 +563,8 @@ def point_to_coordinate(points, use_gpu, num_fragments):
 
     # [NUM_FRAGS x FRAG_SIZE, BATCH_SIZE, NUM_DIMENSIONS]
     padding_tensor = torch.zeros((padding, points.size(1), points.size(2)))
+    if use_gpu:
+        padding_tensor = padding_tensor.cuda()
     points = torch.cat((points, padding_tensor))
 
     points = points.view(num_fragments, -1, batch_size,
@@ -549,7 +573,7 @@ def point_to_coordinate(points, use_gpu, num_fragments):
 
     # Extension function used for single atom reconstruction and whole fragment
     # alignment
-    def extend(prev_three_coords, point, multi_m):
+    def extend(prev_three_coords, point, multi_m, use_gpu):
         """
         Aligns an atom or an entire fragment depending on value of `multi_m`
         with the preceding three atoms.
@@ -568,12 +592,12 @@ def point_to_coordinate(points, use_gpu, num_fragments):
         """
         bc = F.normalize(prev_three_coords.c - prev_three_coords.b, dim=-1)
         n = F.normalize(compute_cross(prev_three_coords.b - prev_three_coords.a,
-                                      bc, dim=2 if multi_m else 1), dim=-1)
+                                      bc, dim=2 if multi_m else 1, use_gpu=use_gpu), dim=-1)
         if multi_m:  # multiple fragments, one atom at a time
-            m = torch.stack([bc, compute_cross(n, bc, dim=2), n]).permute(1, 2, 3, 0)
+            m = torch.stack([bc, compute_cross(n, bc, dim=2, use_gpu=use_gpu), n]).permute(1, 2, 3, 0)
         else:  # single fragment, reconstructed entirely at once.
             s = point.shape + (3,)
-            m = torch.stack([bc, compute_cross(n, bc, dim=1), n]).permute(1, 2, 0)
+            m = torch.stack([bc, compute_cross(n, bc, dim=1, use_gpu=use_gpu), n]).permute(1, 2, 0)
             m = m.repeat(s[0], 1, 1).view(s)
         coord = torch.squeeze(torch.matmul(m, point.unsqueeze(3)),
                               dim=3) + prev_three_coords.c
@@ -585,7 +609,7 @@ def point_to_coordinate(points, use_gpu, num_fragments):
     prev_three_coords = init_coords
 
     for point in points.split(1, dim=0):  # Iterate over FRAG_SIZE
-        coord = extend(prev_three_coords, point.squeeze(0), True)
+        coord = extend(prev_three_coords, point.squeeze(0), True, use_gpu)
         coords_list.append(coord)
         prev_three_coords = Triplet(prev_three_coords.b,
                                     prev_three_coords.c,
@@ -600,13 +624,18 @@ def point_to_coordinate(points, use_gpu, num_fragments):
     for idx in torch.arange(end=-1, start=coords_pretrans.shape[0] - 2, step=-1).split(1, dim=0):
         # Transform the fragments that we have already iterated over to be
         # aligned with the next fragment `coords_trans`
+        if use_gpu:
+          idx = idx.cuda()
         transformed_coords = extend(Triplet(*[di.index_select(0, idx).squeeze(0)
                                               for di in prev_three_coords]),
-                                    coords_trans, False)
+                                    coords_trans, False, use_gpu)
         coords_trans = torch.cat(
             [coords_pretrans.index_select(0, idx).squeeze(0), transformed_coords], 0)
 
-    coords_to_pad = torch.index_select(coords_trans, 0, torch.arange(total_num_angles - 1))
+    idx = torch.arange(total_num_angles - 1)
+    if use_gpu:
+        idx = idx.cuda()
+    coords_to_pad = torch.index_select(coords_trans, 0, idx)
 
     coords = F.pad(coords_to_pad, (0, 0, 0, 0, 1, 0))
 
