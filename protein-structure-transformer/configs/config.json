@@ -1,0 +1,27 @@
+{
+    "model_params": {
+        "nhid": 128,
+        "nlayers": 3,
+        "nhead": 3,
+        "dropout": 0.4
+    },
+    "training_params": {
+        "N_EPOCHS": 20,
+        "USE_GPU": true,
+        "PRINT_EVERY_BATCHES": 40,
+        "lr": 0.0001,
+        "BATCH_SIZE": 16,
+        "LOG_TRAIN_LOSS_EVERY_BATCHES": 100,
+        "TRIG_EXPAND": true
+    },
+    "data": {
+        "training_file": "training_70.hdf5",
+        "train_val_split": "train_val_split_70_15pct.pkl"
+    },
+    "masking_scheme": {
+        "restrict_to_L": true,
+        "max_segment_ratio_of_total": 0.15,
+        "mask_all_segments": true,
+        "total_max_masked": 0.3
+    }
+}

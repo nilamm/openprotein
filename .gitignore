@@ -3,3 +3,4 @@
 __pycache__
 .vscode/settings.json
 .ipynb_checkpoints/*
+casp12-preprocessed/*
